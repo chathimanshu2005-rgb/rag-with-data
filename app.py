@@ -318,6 +318,61 @@ def render_result(result, spec, key_prefix):
         )
 
 
+def call_llm_with_fallback(prompt, models, temperature=0.1, max_tokens=600):
+    """
+    Try each model in order. A 429 on one falls through to the next rather than
+    failing the whole answer. Returns (text, model_used) or (None, None).
+    """
+    last = None
+    for model in models:
+        try:
+            return call_llm(prompt, model=model, temperature=temperature,
+                            max_tokens=max_tokens, retries=0), model
+        except Exception as e:
+            last = e
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                continue
+            raise
+    st.session_state.last_rate_error = str(last) if last else None
+    return None, None
+
+
+def summarize_result_offline(result, spec, matched, applied):
+    """
+    Build an answer from the result table with no API call at all.
+    The numbers came from pandas, so this is exact — it just isn't prose.
+    """
+    parts = []
+    restated = spec.get("restated")
+    if restated:
+        parts.append(f"**{restated}**")
+    parts.append(
+        f"{matched:,} rows matched"
+        + (f" (filters: {'; '.join(applied)})" if applied else " (no filters)")
+        + f", returning {len(result)} row(s)."
+    )
+
+    if len(result) == 1 and len(result.columns) <= 3:
+        pairs = ", ".join(
+            f"{c} = {result.iloc[0][c]:,.2f}" if pd.api.types.is_number(result.iloc[0][c])
+            else f"{c} = {result.iloc[0][c]}"
+            for c in result.columns
+        )
+        parts.append(f"Result: {pairs}")
+    else:
+        num_cols = [c for c in result.columns if pd.api.types.is_numeric_dtype(result[c])]
+        cat_cols = [c for c in result.columns if c not in num_cols]
+        if num_cols and cat_cols:
+            metric, label = num_cols[0], cat_cols[0]
+            top = result.head(3)
+            lines = [f"- {r[label]}: {r[metric]:,.2f}" for _, r in top.iterrows()]
+            parts.append(f"Top {len(lines)} by {metric}:\n" + "\n".join(lines))
+            if len(num_cols) == 1:
+                parts.append(f"Sum of {metric} across shown rows: {result[metric].sum():,.2f}")
+    parts.append("_Chart and full table below._")
+    return "\n\n".join(parts)
+
+
 # ========== LLM CALLS ==========
 def est_tokens(text):
     """Rough token estimate: ~4 chars per token. Good enough for budgeting."""
@@ -611,6 +666,7 @@ for key, default in [
     ("doc_chunks", []),
     ("file_stats", []),
     ("api_calls", []),
+    ("last_rate_error", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -707,6 +763,10 @@ with st.sidebar:
     )
 
     st.divider()
+    narrate = st.checkbox(
+        "Narrate answers with the LLM", value=True,
+        help="Off = zero API calls for phrasing. Numbers, charts and tables still work fully.",
+    )
     show_spec = st.checkbox(
         "Show query spec", value=False,
         help="Display the JSON the model generated for each question.",
@@ -757,16 +817,39 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
                 with st.spinner("Running query..."):
                     result, matched, applied = run_spec(df, spec)
                     shown = result.head(MAX_ROWS_TO_LLM)
-                    answer = call_llm(ANSWER_TEMPLATE.format(
-                        restated=spec.get("restated", "-"),
-                        applied="; ".join(applied) or "none",
-                        matched=f"{matched:,}",
-                        shown=f"{len(shown)} of {len(result)}",
-                        result=shown.to_csv(index=False) if len(shown) else "(empty)",
-                        question=prompt,
-                    ), model=MODEL_ANSWER, temperature=0.2, max_tokens=600)
-                st.markdown(answer)
-                st.caption(f"Computed from {matched:,} matching rows")
+
+                answer, model_used = None, None
+                if narrate:
+                    answer, model_used = call_llm_with_fallback(
+                        ANSWER_TEMPLATE.format(
+                            restated=spec.get("restated", "-"),
+                            applied="; ".join(applied) or "none",
+                            matched=f"{matched:,}",
+                            shown=f"{len(shown)} of {len(result)}",
+                            result=shown.to_csv(index=False) if len(shown) else "(empty)",
+                            question=prompt,
+                        ),
+                        models=[MODEL_ANSWER, MODEL_PLANNER],
+                        temperature=0.2, max_tokens=600,
+                    )
+
+                if answer is None:
+                    answer = summarize_result_offline(result, spec, matched, applied)
+                    st.markdown(answer)
+                    if narrate:
+                        st.warning(
+                            "Both models are rate-limited, so this answer was built directly "
+                            "from the query result. The figures are exact — only the wording "
+                            "is unpolished."
+                        )
+                        err = st.session_state.get("last_rate_error")
+                        if err:
+                            with st.expander("Groq's exact response"):
+                                st.code(err, language="text")
+                else:
+                    st.markdown(answer)
+                    st.caption(f"Computed from {matched:,} matching rows · phrased by {model_used}")
+
                 if len(result):
                     render_result(result, spec, key_prefix=f"live_{len(st.session_state.messages)}")
                     record["result_table"] = result.to_dict("records")
@@ -775,22 +858,26 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
             elif route == "docs" and st.session_state.doc_chunks:
                 hits, best = retrieve_docs(load_embedder(), prompt)
                 context = "\n\n---\n\n".join(c for c, _ in hits)
-                answer = call_llm(
+                answer, model_used = call_llm_with_fallback(
                     f"Answer using the document extracts below.\n\n=== EXTRACTS ===\n{context}\n\n"
                     f"=== QUESTION ===\n{prompt}\n\nIf the extracts do not answer it, say so.",
-                    model=MODEL_ANSWER, max_tokens=600,
+                    models=[MODEL_ANSWER, MODEL_PLANNER], max_tokens=600,
                 )
+                if answer is None:
+                    raise RuntimeError(st.session_state.get("last_rate_error", "rate_limit_exceeded"))
                 st.markdown(answer)
                 st.caption(f"From documents (top score {best:.2f})")
 
             else:
-                answer = call_llm(
+                answer, model_used = call_llm_with_fallback(
                     f"=== RECENT CONVERSATION ===\n{history}\n\n=== QUESTION ===\n{prompt}\n\n"
                     "Answer clearly using general knowledge.",
-                    model=MODEL_ANSWER, max_tokens=600,
+                    models=[MODEL_ANSWER, MODEL_PLANNER], max_tokens=600,
                 )
+                if answer is None:
+                    raise RuntimeError(st.session_state.get("last_rate_error", "rate_limit_exceeded"))
                 st.markdown(answer)
-                st.caption("General knowledge")
+                st.caption(f"General knowledge · {model_used}")
 
             if show_spec:
                 with st.expander("Query spec"):
