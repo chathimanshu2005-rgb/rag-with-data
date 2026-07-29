@@ -6,6 +6,7 @@ import json
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 import requests
 
 from groq import Groq
@@ -29,6 +30,11 @@ EMBED_BATCH_SIZE = 64
 MAX_RESULT_ROWS = 200          # rows returned from a query
 MAX_ROWS_TO_LLM = 60           # rows actually shown to the model for phrasing
 MAX_DISTINCT_LISTED = 60       # cardinality cutoff for listing values in the schema
+MAX_CHART_ROWS = 40            # bars beyond this are unreadable
+
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+          "jul", "aug", "sep", "oct", "nov", "dec"]
+CHART_TYPES = {"bar", "line", "scatter", "area", "none"}
 
 NUMERIC_COLS = [
     "mf", "initial_reading_kwh", "final_reading_kwh", "pf", "kwh", "kwh_exp",
@@ -216,6 +222,103 @@ def run_spec(df, spec, max_rows=MAX_RESULT_ROWS):
     return out.head(limit), matched_rows, applied
 
 
+# ========== CHARTING ==========
+def month_order(values):
+    """Return values ordered Jan..Dec if they all look like month names, else None."""
+    vals = [str(v).strip() for v in values]
+    keys = []
+    for v in vals:
+        k = v.lower()[:3]
+        if k not in MONTHS:
+            return None
+        keys.append(MONTHS.index(k))
+    return [v for _, v in sorted(zip(keys, vals))]
+
+
+def infer_chart(result):
+    """Fallback when the planner gives no usable chart: pick something sensible."""
+    if result is None or len(result) < 2 or len(result) > 500:
+        return None
+    num = [c for c in result.columns if pd.api.types.is_numeric_dtype(result[c])]
+    cat = [c for c in result.columns if c not in num]
+    if cat and num:
+        kind = "line" if month_order(result[cat[0]].unique()) else "bar"
+        return {"type": kind, "x": cat[0], "y": num[0],
+                "color": cat[1] if len(cat) > 1 else None}
+    if len(num) >= 2:
+        return {"type": "scatter", "x": num[0], "y": num[1], "color": None}
+    return None
+
+
+def build_chart(result, spec):
+    """Turn a chart spec into an Altair chart. Returns (chart, note) or (None, None)."""
+    if not spec or spec.get("type") in (None, "none"):
+        return None, None
+    kind, x, y, color = spec.get("type"), spec.get("x"), spec.get("y"), spec.get("color")
+    if kind not in CHART_TYPES or x not in result.columns or y not in result.columns:
+        return None, None
+    if not pd.api.types.is_numeric_dtype(result[y]):
+        return None, None
+
+    data, note = result, None
+    if len(data) > MAX_CHART_ROWS:
+        data = data.head(MAX_CHART_ROWS)
+        note = f"Chart shows the first {MAX_CHART_ROWS} of {len(result)} rows."
+
+    x_is_num = pd.api.types.is_numeric_dtype(data[x])
+    order = None if x_is_num else month_order(data[x].unique())
+
+    if x_is_num:
+        x_enc = alt.X(f"{x}:Q", title=x)
+    elif order:
+        x_enc = alt.X(f"{x}:N", sort=order, title=x)
+    else:
+        # preserve the order the query produced (usually sorted by the metric)
+        x_enc = alt.X(f"{x}:N", sort=list(data[x].astype(str)), title=x)
+
+    enc = {
+        "x": x_enc,
+        "y": alt.Y(f"{y}:Q", title=y),
+        "tooltip": [alt.Tooltip(c) for c in data.columns[:6]],
+    }
+    if color and color in data.columns:
+        enc["color"] = alt.Color(f"{color}:N", title=color)
+
+    base = alt.Chart(data)
+    marks = {
+        "bar": base.mark_bar(),
+        "line": base.mark_line(point=True),
+        "area": base.mark_area(opacity=0.7),
+        "scatter": base.mark_circle(size=70),
+    }
+    chart = marks[kind].encode(**enc).properties(
+        height=340, title=spec.get("title") or ""
+    ).interactive()
+    return chart, note
+
+
+def render_result(result, spec, key_prefix):
+    """Render chart + table + download for a query result."""
+    chart_spec = spec.get("chart") or infer_chart(result)
+    chart, note = build_chart(result, chart_spec)
+    if chart is None and chart_spec:
+        # planner spec was unusable; try the inferred one before giving up
+        chart, note = build_chart(result, infer_chart(result))
+    if chart is not None:
+        st.altair_chart(chart, use_container_width=True)
+        if note:
+            st.caption(note)
+    with st.expander(f"Result table ({len(result)} rows)"):
+        st.dataframe(result, use_container_width=True)
+        st.download_button(
+            "Download CSV",
+            result.to_csv(index=False).encode("utf-8"),
+            file_name="query_result.csv",
+            mime="text/csv",
+            key=f"dl_{key_prefix}",
+        )
+
+
 # ========== LLM CALLS ==========
 def call_llm(prompt, temperature=0.1, max_tokens=1024):
     resp = groq_client.chat.completions.create(
@@ -264,6 +367,16 @@ If route is "data", build the spec. Rules:
 - op must be one of: ==, !=, >, >=, <, <=, in, not_in, contains, isnull, notnull
 - Set "limit" sensibly (e.g. 10 for "top 10", 50 otherwise).
 
+Also choose a chart for the result:
+- "bar"     -> comparing a metric across categories (division, region, circle), or a ranking
+- "line"    -> a metric across bill_month or billi_year (a trend over time)
+- "scatter" -> relationship between two numeric columns (e.g. pf vs kwh)
+- "area"    -> cumulative or stacked totals over time
+- "none"    -> the result is a single number, or a plain row lookup
+Set "x" to the category or time column, "y" to the numeric metric (use the "as" alias
+you defined in aggregations). Set "color" only when a second grouping column splits the
+data into series; otherwise null.
+
 Respond with JSON ONLY, no prose, no markdown fences:
 {{
   "route": "data",
@@ -273,7 +386,9 @@ Respond with JSON ONLY, no prose, no markdown fences:
   "aggregations": [{{"column": "kwh", "func": "sum", "as": "total_kwh"}}],
   "columns": [],
   "sort": {{"by": "total_kwh", "desc": true}},
-  "limit": 10
+  "limit": 10,
+  "chart": {{"type": "bar", "x": "division", "y": "total_kwh", "color": null,
+             "title": "Total kWh by division, March 2026"}}
 }}"""
 
 ANSWER_TEMPLATE = """You are a power-distribution data analyst. Answer the user's question using the query result below.
@@ -527,12 +642,12 @@ if df is None:
 
 
 # ========== CHAT ==========
-for m in st.session_state.messages:
+for i, m in enumerate(st.session_state.messages):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
         if m.get("result_table"):
-            with st.expander("Result table"):
-                st.dataframe(pd.DataFrame(m["result_table"]), use_container_width=True)
+            past = pd.DataFrame(m["result_table"])
+            render_result(past, {"chart": m.get("chart")}, key_prefix=f"hist_{i}")
         if m.get("spec"):
             with st.expander("Query spec"):
                 st.code(json.dumps(m["spec"], indent=2), language="json")
@@ -558,7 +673,8 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
                 spec = parse_json(plan_raw) or {"route": "general"}
 
             route = spec.get("route", "general")
-            record = {"role": "assistant", "spec": spec if show_spec else None, "result_table": None}
+            record = {"role": "assistant", "spec": spec if show_spec else None,
+                      "result_table": None, "chart": None}
 
             if route == "data":
                 with st.spinner("Running query..."):
@@ -576,9 +692,9 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
                 st.markdown(answer)
                 st.caption(f"Computed from {matched:,} matching rows")
                 if len(result):
-                    with st.expander("Result table"):
-                        st.dataframe(result, use_container_width=True)
+                    render_result(result, spec, key_prefix=f"live_{len(st.session_state.messages)}")
                     record["result_table"] = result.to_dict("records")
+                    record["chart"] = spec.get("chart") or infer_chart(result)
 
             elif route == "docs" and st.session_state.doc_chunks:
                 hits, best = retrieve_docs(load_embedder(), prompt)
