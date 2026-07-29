@@ -44,6 +44,57 @@ try:
 except Exception as e:
     st.sidebar.error(f"Embedder Error: {e}")
 
+# ========== NEW: SUPABASE PERMANENT DATABASE CONNECTION ==========
+SUPABASE_URL = "https://hhwjxievppujzlnyqykp.supabase.co"
+
+supabase_anon_key = None
+try:
+    if "SUPABASE_ANON_KEY" in st.secrets:
+        supabase_anon_key = st.secrets["SUPABASE_ANON_KEY"]
+except Exception:
+    pass
+if not supabase_anon_key:
+    supabase_anon_key = os.getenv("SUPABASE_ANON_KEY")
+
+DB_TABLE_NAME = "feeder_billing_consumption"
+
+# ===== NEW: COLUMN KNOWLEDGE — edit this to teach the AI your data =====
+TABLE_KNOWLEDGE = """
+TABLE: feeder_billing_consumption — DISCOM feeder-level billing and consumption data
+
+Column meanings:
+- region, circle, division, zone: Administrative hierarchy of MP East DISCOM
+- substation, substation_code, feeder, feeder_code: Physical infrastructure identifiers
+- meter_serial_number: Unique meter ID on the feeder
+- mf: Meter multiplication factor
+- category: Feeder category (e.g., "In" = incoming feeder)
+- bill_month, billi_year: Billing cycle month and year
+- initial_reading_kwh, final_reading_kwh: Meter readings at start/end of billing cycle
+- pf: Power factor (0 to 1); low PF indicates inefficient load
+- kwh: Active energy consumed (kilowatt-hours) in the billing cycle
+- kwh_exp: Exported energy (kWh) — relevant for feeders with reverse power flow
+- kvah: Apparent energy (kilovolt-ampere-hours)
+- md_kw, md_kva: Maximum demand recorded during the cycle (kW and kVA)
+- kvarh_q1 to q4: Reactive energy by quadrant — used for power factor penalty calculations
+- pwr_on_dur: Duration the feeder was powered on during the cycle
+
+Use this glossary to correctly interpret any question about this table's data.
+"""
+
+def load_db_table_as_text():
+    """Fetch the feeder billing table from Supabase and return as text for chunking"""
+    headers = {
+        "apikey": supabase_anon_key,
+        "Authorization": f"Bearer {supabase_anon_key}"
+    }
+    url = f"{SUPABASE_URL}/rest/v1/{DB_TABLE_NAME}?select=*"
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    df = pd.DataFrame(data)
+    return df.to_string(index=False), len(df)
+# ========== END NEW SUPABASE SECTION ==========
+
 # ========== SESSION STATE ==========
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -55,6 +106,8 @@ if "file_stats" not in st.session_state:
     st.session_state.file_stats = []
 if "ready" not in st.session_state:
     st.session_state.ready = False
+if "db_loaded" not in st.session_state:   # NEW
+    st.session_state.db_loaded = False    # NEW
 
 # ========== TEXT EXTRACTION FUNCTIONS ==========
 def extract_pdf_text(file):
@@ -153,6 +206,47 @@ def process_file(file):
     else:
         return "", 0
 
+# ========== NEW: AUTO-LOAD LIVE DATABASE TABLE ON STARTUP ==========
+if not st.session_state.db_loaded and embedder and supabase_anon_key:
+    with st.spinner("Connecting to live DISCOM database..."):
+        try:
+            db_text, row_count = load_db_table_as_text()
+
+            chunks = []
+            start = 0
+            while start < len(db_text):
+                end = min(start + 1000, len(db_text))
+                chunk = db_text[start:end].strip()
+                if len(chunk) > 50:
+                    chunks.append(chunk)
+                start = end - 150 if end < len(db_text) else end
+
+            embeddings = []
+            for chunk in chunks:
+                emb_gen = embedder.embed([chunk[:8000]])
+                emb = np.array(list(emb_gen)[0], dtype=np.float32)
+                embeddings.append(emb)
+
+            if embeddings:
+                if st.session_state.embeddings is None:
+                    st.session_state.embeddings = np.array(embeddings)
+                    st.session_state.chunks = chunks
+                else:
+                    st.session_state.embeddings = np.vstack([st.session_state.embeddings, np.array(embeddings)])
+                    st.session_state.chunks.extend(chunks)
+
+                st.session_state.file_stats.append({
+                    "name": f"{DB_TABLE_NAME} (live DB)",
+                    "pages": row_count,
+                    "chunks": len(chunks)
+                })
+                st.session_state.ready = True
+            st.session_state.db_loaded = True
+        except Exception as e:
+            st.sidebar.error(f"DB connection error: {e}")
+            st.session_state.db_loaded = True  # don't keep retrying every rerun
+# ========== END NEW AUTO-LOAD SECTION ==========
+
 # ========== SIDEBAR ==========
 with st.sidebar:
     st.header("🔌 Status")
@@ -164,6 +258,11 @@ with st.sidebar:
     
     if embedder:
         st.success("✅ Local Embedder Ready")
+
+    if supabase_anon_key:                              # NEW
+        st.success("✅ Live DB Connected")               # NEW
+    else:                                                # NEW
+        st.warning("⚠️ Supabase key not set")            # NEW
     
     st.divider()
     
@@ -402,6 +501,9 @@ if prompt := st.chat_input("Ask anything about your documents... or anything els
                         system_prompt = f"""You are a helpful assistant. The user has uploaded documents that may contain relevant information. 
 Use the document context below to answer if it helps. If the documents don't fully answer the question, supplement with your general knowledge.
 
+=== TABLE/COLUMN KNOWLEDGE (use this to interpret any database data correctly) ===
+{TABLE_KNOWLEDGE}
+
 === RELEVANT DOCUMENT CONTEXT ===
 {context}
 
@@ -430,6 +532,9 @@ Provide a clear, accurate, and helpful answer."""
                 else:
                     system_prompt = f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
 If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
+
+=== TABLE/COLUMN KNOWLEDGE (use this to interpret any database data correctly) ===
+{TABLE_KNOWLEDGE}
 
 === CONTEXT FROM DOCUMENTS ===
 {context}
