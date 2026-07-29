@@ -21,6 +21,10 @@ CHUNK_OVERLAP = 150
 TOP_K = 3
 RELEVANCE_THRESHOLD = 0.55
 
+EMBED_BATCH_SIZE = 64        # embed in batches, not one chunk at a time
+ROWS_PER_CHUNK = 15          # DB chunks are whole rows, never split mid-value
+DEFAULT_MAX_DB_ROWS = 2000   # hard cap on rows indexed from the live table
+
 SUPABASE_URL = "https://hhwjxievppujzlnyqykp.supabase.co"
 DB_TABLE_NAME = "feeder_billing_consumption"
 DB_PAGE_SIZE = 1000
@@ -117,13 +121,19 @@ def fetch_all_rows(select="*", page_size=DB_PAGE_SIZE):
         offset += page_size
 
 
-def load_db_table_as_text():
-    """Fetch the feeder billing table from Supabase and return it as text for chunking."""
-    rows = fetch_all_rows()
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return "", 0
-    return df.to_string(index=False), len(df)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=2)
+def fetch_db_rows(max_rows):
+    """Cached row fetch — one network round trip per hour, shared across all sessions."""
+    return fetch_all_rows()[:max_rows]
+
+
+def rows_to_chunks(rows, rows_per_chunk=ROWS_PER_CHUNK):
+    """Serialize rows compactly and group them so a chunk never splits a row."""
+    lines = [
+        " | ".join(f"{k}={v}" for k, v in row.items() if v not in (None, ""))
+        for row in rows
+    ]
+    return ["\n".join(lines[i:i + rows_per_chunk]) for i in range(0, len(lines), rows_per_chunk)]
 
 
 def get_distinct_values(column_name):
@@ -158,19 +168,22 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
-def embed_chunks(chunks, show_progress=False):
-    """Embed chunks, returning (kept_chunks, embeddings) so the two stay aligned."""
+def embed_chunks(chunks, show_progress=False, batch_size=EMBED_BATCH_SIZE):
+    """Embed chunks in batches, returning (kept_chunks, embeddings) so the two stay aligned."""
+    if not chunks:
+        return [], []
     kept, vectors = [], []
     progress = st.progress(0) if show_progress else None
-    for i, chunk in enumerate(chunks):
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
         try:
-            vector = np.array(list(embedder.embed([chunk[:8000]]))[0], dtype=np.float32)
-            kept.append(chunk)
-            vectors.append(vector)
+            out = list(embedder.embed([c[:8000] for c in batch], batch_size=batch_size))
+            kept.extend(batch)
+            vectors.extend(np.asarray(v, dtype=np.float32) for v in out)
         except Exception as e:
-            st.warning(f"Embed error on chunk {i}: {e}")
+            st.warning(f"Embed error near chunk {start}: {e}")
         if progress:
-            progress.progress((i + 1) / len(chunks))
+            progress.progress(min((start + batch_size) / len(chunks), 1.0))
     if progress:
         progress.empty()
     return kept, vectors
@@ -289,29 +302,31 @@ def process_file(file):
     return "", 0
 
 
-# ========== AUTO-LOAD LIVE DATABASE TABLE ON STARTUP ==========
-def load_database_into_index():
-    db_text, row_count = load_db_table_as_text()
-    if not db_text:
-        st.sidebar.warning("⚠️ Database table returned no rows.")
-        return
-    chunks = chunk_text(db_text)
+# ========== LIVE DATABASE INDEX (cached, on demand) ==========
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=2)
+def build_db_index(max_rows):
+    """Fetch + chunk + embed the live table ONCE per app process, not per session."""
+    rows = fetch_db_rows(max_rows)
+    if not rows:
+        return [], None, 0
+    chunks = rows_to_chunks(rows)
     kept, vectors = embed_chunks(chunks)
-    add_to_index(kept, vectors, {
+    if not vectors:
+        return [], None, len(rows)
+    return kept, np.array(vectors, dtype=np.float32), len(rows)
+
+
+def load_database_into_index(max_rows):
+    chunks, matrix, row_count = build_db_index(max_rows)
+    if matrix is None:
+        st.sidebar.warning("⚠️ Database returned no usable rows.")
+        return
+    add_to_index(chunks, list(matrix), {
         "name": f"{DB_TABLE_NAME} (live DB)",
         "pages": row_count,
-        "chunks": len(kept),
+        "chunks": len(chunks),
     })
-
-
-if not st.session_state.db_loaded and embedder and supabase_anon_key:
-    with st.spinner("Connecting to live DISCOM database..."):
-        try:
-            load_database_into_index()
-        except Exception as e:
-            st.sidebar.error(f"DB connection error: {e}")
-        finally:
-            st.session_state.db_loaded = True  # don't retry on every rerun
+    st.session_state.db_loaded = True
 
 
 # ========== SIDEBAR ==========
@@ -327,18 +342,36 @@ with st.sidebar:
         st.success("✅ Local Embedder Ready")
 
     if supabase_anon_key:
-        st.success("✅ Live DB Connected")
-        if st.button("🔄 Reload Live DB", use_container_width=True):
-            with st.spinner("Reloading database..."):
-                try:
-                    st.session_state.embeddings = None
-                    st.session_state.chunks = []
-                    st.session_state.file_stats = []
-                    st.session_state.ready = False
-                    load_database_into_index()
-                    st.success("✅ Database reloaded")
-                except Exception as e:
-                    st.error(f"DB reload error: {e}")
+        st.success("✅ Supabase Configured")
+
+        max_db_rows = st.number_input(
+            "Rows to index from live DB",
+            min_value=100,
+            max_value=20000,
+            value=DEFAULT_MAX_DB_ROWS,
+            step=500,
+            help="Higher values cost CPU on every cold start. Keep this modest on free tiers.",
+        )
+
+        if not st.session_state.db_loaded:
+            if st.button("🔌 Load Live DB", type="primary", use_container_width=True):
+                with st.spinner("Indexing live DISCOM table..."):
+                    try:
+                        load_database_into_index(int(max_db_rows))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"DB connection error: {e}")
+        else:
+            st.caption("✅ Live DB indexed")
+            if st.button("🔄 Rebuild DB Index", use_container_width=True):
+                build_db_index.clear()
+                fetch_db_rows.clear()
+                st.session_state.embeddings = None
+                st.session_state.chunks = []
+                st.session_state.file_stats = []
+                st.session_state.ready = False
+                st.session_state.db_loaded = False
+                st.rerun()
     else:
         st.warning("⚠️ Supabase key not set")
 
@@ -457,7 +490,7 @@ if not groq_client or not embedder:
     st.stop()
 
 if not st.session_state.ready:
-    st.info("👈 **Upload files or connect a Google Sheet in the sidebar to start chatting.**")
+    st.info("👈 **Load the live DB, upload files, or connect a Google Sheet in the sidebar to start chatting.**")
     st.markdown(
         """
         ### 💡 Supported formats:
