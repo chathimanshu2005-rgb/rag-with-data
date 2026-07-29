@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import time
 
 import streamlit as st
 import pandas as pd
@@ -22,14 +23,17 @@ SUPABASE_URL = "https://hhwjxievppujzlnyqykp.supabase.co"
 DB_TABLE_NAME = "feeder_billing_consumption"
 DB_PAGE_SIZE = 1000
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL_PLANNER = "llama-3.1-8b-instant"     # structured JSON — small model is plenty
+MODEL_ANSWER = "llama-3.3-70b-versatile"   # prose quality where it matters
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 TOP_K = 3
 EMBED_BATCH_SIZE = 64
 MAX_RESULT_ROWS = 200          # rows returned from a query
-MAX_ROWS_TO_LLM = 60           # rows actually shown to the model for phrasing
-MAX_DISTINCT_LISTED = 60       # cardinality cutoff for listing values in the schema
+MAX_ROWS_TO_LLM = 15           # rows shown to the model for phrasing (token cost)
+MAX_DISTINCT_LISTED = 25       # cardinality cutoff for listing values in the schema
+MAX_HISTORY_MSGS = 2           # conversation turns replayed into the planner
+MAX_HISTORY_CHARS = 200
 MAX_CHART_ROWS = 40            # bars beyond this are unreadable
 
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
@@ -130,25 +134,20 @@ def load_dataframe():
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
 def build_schema_summary(_df, fingerprint):
     """
-    Describe the table to the model: dtypes, ranges, and — critically — the actual
-    distinct values of categorical columns, so filters match real data.
+    Describe the table to the model as compactly as possible — this text is resent
+    with every question, so every token here is paid for on each turn.
     """
-    lines = [f"Table: {DB_TABLE_NAME}  ({len(_df)} rows)", "", "Columns:"]
+    lines = [f"Table {DB_TABLE_NAME} ({len(_df)} rows). Columns:"]
     for col in _df.columns:
         s = _df[col]
         if pd.api.types.is_numeric_dtype(s):
-            lines.append(
-                f"- {col} (numeric): min={s.min():.4g}, max={s.max():.4g}, "
-                f"mean={s.mean():.4g}, nulls={int(s.isna().sum())}"
-            )
+            lines.append(f"{col} (num {s.min():.4g}..{s.max():.4g})")
         else:
             distinct = s.dropna().astype(str).str.strip().unique()
             if len(distinct) <= MAX_DISTINCT_LISTED:
-                vals = ", ".join(sorted(distinct)[:MAX_DISTINCT_LISTED])
-                lines.append(f"- {col} (text): {len(distinct)} distinct -> {vals}")
+                lines.append(f"{col} (text): {', '.join(sorted(distinct))}")
             else:
-                sample = ", ".join(sorted(distinct)[:8])
-                lines.append(f"- {col} (text): {len(distinct)} distinct, e.g. {sample}, ...")
+                lines.append(f"{col} (text, {len(distinct)} values)")
     return "\n".join(lines)
 
 
@@ -320,14 +319,84 @@ def render_result(result, spec, key_prefix):
 
 
 # ========== LLM CALLS ==========
-def call_llm(prompt, temperature=0.1, max_tokens=1024):
-    resp = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model=MODEL,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return resp.choices[0].message.content
+def est_tokens(text):
+    """Rough token estimate: ~4 chars per token. Good enough for budgeting."""
+    return max(1, len(text) // 4)
+
+
+def record_call(tokens):
+    now = time.time()
+    calls = [c for c in st.session_state.api_calls if now - c[0] < 60]
+    calls.append((now, tokens))
+    st.session_state.api_calls = calls
+
+
+def usage_last_minute():
+    now = time.time()
+    recent = [c for c in st.session_state.api_calls if now - c[0] < 60]
+    return len(recent), sum(t for _, t in recent)
+
+
+def parse_retry_after(msg):
+    for pattern in (r"try again in ([\d.]+)s", r"retry[-_ ]?after[\"':\s]+([\d.]+)"):
+        m = re.search(pattern, msg, re.I)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def describe_rate_error(msg):
+    """Groq's message says which limit tripped — surface it instead of guessing."""
+    low = msg.lower()
+    if "tokens per day" in low or "tpd" in low:
+        kind = "daily token limit (TPD)"
+    elif "tokens per minute" in low or "tpm" in low:
+        kind = "tokens-per-minute limit (TPM)"
+    elif "requests per day" in low or "rpd" in low:
+        kind = "daily request limit (RPD)"
+    elif "requests per minute" in low or "rpm" in low:
+        kind = "requests-per-minute limit (RPM)"
+    else:
+        kind = "rate limit"
+    wait = parse_retry_after(msg)
+    suffix = f" Retry in about {wait:.0f}s." if wait else ""
+    return f"Groq {kind} reached.{suffix}", msg
+
+
+def call_llm(prompt, model, temperature=0.1, max_tokens=1024, retries=1):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            resp = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            text = resp.choices[0].message.content
+            used = getattr(resp, "usage", None)
+            record_call(used.total_tokens if used else est_tokens(prompt) + est_tokens(text))
+            return text
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "429" not in msg and "rate_limit" not in msg.lower():
+                raise
+            wait = parse_retry_after(msg)
+            if attempt < retries and wait is not None and wait <= 15:
+                time.sleep(wait + 0.5)
+                continue
+            raise
+    raise last_error
+
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=300)
+def plan_query(question, history, schema, model):
+    """Cached: asking the same question twice costs zero API calls."""
+    raw = call_llm(PLANNER_TEMPLATE.format(
+        knowledge=TABLE_KNOWLEDGE, schema=schema, history=history, question=question,
+    ), model=model, temperature=0.0, max_tokens=450)
+    return parse_json(raw) or {"route": "general"}
 
 
 def parse_json(text):
@@ -393,15 +462,13 @@ Respond with JSON ONLY, no prose, no markdown fences:
 
 ANSWER_TEMPLATE = """You are a power-distribution data analyst. Answer the user's question using the query result below.
 
-{knowledge}
-
 === WHAT WAS COMPUTED ===
 {restated}
 Filters applied: {applied}
 Rows matching the filters: {matched}
 Result rows shown: {shown}
 
-=== QUERY RESULT ===
+=== QUERY RESULT (CSV) ===
 {result}
 
 === USER QUESTION ===
@@ -543,6 +610,7 @@ for key, default in [
     ("doc_embeddings", None),
     ("doc_chunks", []),
     ("file_stats", []),
+    ("api_calls", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -625,6 +693,20 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    st.subheader("API budget")
+    calls_min, tokens_min = usage_last_minute()
+    c1, c2 = st.columns(2)
+    c1.metric("Calls (60s)", f"{calls_min}/30")
+    c2.metric("Tokens (60s)", f"{tokens_min:,}")
+    if tokens_min > 9000:
+        st.warning("Approaching the per-minute token cap. Pause briefly.")
+    st.caption(
+        f"Planner: {MODEL_PLANNER}  \nAnswers: {MODEL_ANSWER}  \n"
+        "Separate models draw on separate free-tier buckets. "
+        "This meter counts this browser session only — Groq counts your whole account."
+    )
+
+    st.divider()
     show_spec = st.checkbox(
         "Show query spec", value=False,
         help="Display the JSON the model generated for each question.",
@@ -660,17 +742,12 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
     with st.chat_message("assistant"):
         try:
             history = "\n".join(
-                f"{m['role']}: {m['content'][:300]}" for m in st.session_state.messages[-5:-1]
+                f"{m['role']}: {m['content'][:MAX_HISTORY_CHARS]}"
+                for m in st.session_state.messages[-(MAX_HISTORY_MSGS + 1):-1]
             )
 
             with st.spinner("Planning query..."):
-                plan_raw = call_llm(PLANNER_TEMPLATE.format(
-                    knowledge=TABLE_KNOWLEDGE,
-                    schema=schema_summary,
-                    history=history,
-                    question=prompt,
-                ), temperature=0.0, max_tokens=700)
-                spec = parse_json(plan_raw) or {"route": "general"}
+                spec = plan_query(prompt, history, schema_summary, MODEL_PLANNER)
 
             route = spec.get("route", "general")
             record = {"role": "assistant", "spec": spec if show_spec else None,
@@ -681,14 +758,13 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
                     result, matched, applied = run_spec(df, spec)
                     shown = result.head(MAX_ROWS_TO_LLM)
                     answer = call_llm(ANSWER_TEMPLATE.format(
-                        knowledge=TABLE_KNOWLEDGE,
                         restated=spec.get("restated", "-"),
                         applied="; ".join(applied) or "none",
                         matched=f"{matched:,}",
                         shown=f"{len(shown)} of {len(result)}",
-                        result=shown.to_string(index=False) if len(shown) else "(empty)",
+                        result=shown.to_csv(index=False) if len(shown) else "(empty)",
                         question=prompt,
-                    ), temperature=0.2)
+                    ), model=MODEL_ANSWER, temperature=0.2, max_tokens=600)
                 st.markdown(answer)
                 st.caption(f"Computed from {matched:,} matching rows")
                 if len(result):
@@ -701,7 +777,8 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
                 context = "\n\n---\n\n".join(c for c, _ in hits)
                 answer = call_llm(
                     f"Answer using the document extracts below.\n\n=== EXTRACTS ===\n{context}\n\n"
-                    f"=== QUESTION ===\n{prompt}\n\nIf the extracts do not answer it, say so."
+                    f"=== QUESTION ===\n{prompt}\n\nIf the extracts do not answer it, say so.",
+                    model=MODEL_ANSWER, max_tokens=600,
                 )
                 st.markdown(answer)
                 st.caption(f"From documents (top score {best:.2f})")
@@ -709,7 +786,8 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
             else:
                 answer = call_llm(
                     f"=== RECENT CONVERSATION ===\n{history}\n\n=== QUESTION ===\n{prompt}\n\n"
-                    "Answer clearly using general knowledge."
+                    "Answer clearly using general knowledge.",
+                    model=MODEL_ANSWER, max_tokens=600,
                 )
                 st.markdown(answer)
                 st.caption("General knowledge")
@@ -722,7 +800,15 @@ if prompt := st.chat_input("e.g. total kWh by division for March 2026"):
             st.session_state.messages.append(record)
 
         except Exception as e:
-            if "429" in str(e):
-                st.error("Groq rate limit (30/min). Wait a few seconds.")
+            msg = str(e)
+            if "429" in msg or "rate_limit" in msg.lower():
+                headline, detail = describe_rate_error(msg)
+                st.error(headline)
+                with st.expander("Groq's exact response"):
+                    st.code(detail, language="text")
+                st.caption(
+                    "Free-tier caps are per model. Adding a card to your Groq account "
+                    "upgrades you to the Developer tier at no cost and raises limits substantially."
+                )
             else:
                 st.error(f"Error: {e}")
