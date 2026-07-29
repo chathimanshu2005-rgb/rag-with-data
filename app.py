@@ -82,6 +82,7 @@ Use this glossary to correctly interpret any question about this table's data.
 """
 
 def load_db_table_as_text():
+   def load_db_table_as_text():
     """Fetch the feeder billing table from Supabase and return as text for chunking"""
     headers = {
         "apikey": supabase_anon_key,
@@ -93,6 +94,18 @@ def load_db_table_as_text():
     data = response.json()
     df = pd.DataFrame(data)
     return df.to_string(index=False), len(df)
+       def get_distinct_values(column_name):
+    """Fetch all distinct values for a given column directly from Supabase"""
+    headers = {
+        "apikey": supabase_anon_key,
+        "Authorization": f"Bearer {supabase_anon_key}"
+    }
+    url = f"{SUPABASE_URL}/rest/v1/{DB_TABLE_NAME}?select={column_name}"
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    values = sorted(set(row[column_name] for row in data if row.get(column_name)))
+    return values
 # ========== END NEW SUPABASE SECTION ==========
 
 # ========== SESSION STATE ==========
